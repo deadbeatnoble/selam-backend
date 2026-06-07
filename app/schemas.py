@@ -54,7 +54,7 @@ class MoodResponse(BaseModel):
 
 class AssessmentAnswer(BaseModel):
     question_id: int
-    score: int = Field(..., ge=0, le=4)
+    score: int = Field(..., ge=0, le=3)
 
 
 class AssessmentSubmit(BaseModel):
@@ -63,10 +63,12 @@ class AssessmentSubmit(BaseModel):
 
 class AssessmentResult(BaseModel):
     id: str
+    total_score: int = 0
     stress_score: int
     anxiety_score: int
     depression_score: int
     risk_level: Literal["green", "yellow", "red"]
+    risk_tier: str = "low"
     recommendation: str
     created_at: datetime
 
