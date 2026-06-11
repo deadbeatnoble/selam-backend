@@ -84,7 +84,10 @@ BOOKS_FALLBACK = {
             "title": "Recommended Reads",
             "books": [
                 {"title": "The Gifts of Imperfection", "author": "Brené Brown", "description": "A short guide to self-compassion."},
+                {"title": "Atomic Habits", "author": "James Clear", "description": "Small habits that build steady wellbeing."},
+                {"title": "The Anxiety Toolkit", "author": "Alice Boyes", "description": "Practical exercises for worry and stress."},
                 {"title": "Reasons to Stay Alive", "author": "Matt Haig", "description": "Hopeful reflections on hard times."},
+                {"title": "Ikigai", "author": "Héctor García & Francesc Miralles", "description": "Purpose and balance for everyday life."},
                 {"title": "Mindfulness in Plain English", "author": "Bhante Henepola Gunaratana", "description": "Simple steps to calm your mind."},
             ],
         },
@@ -176,7 +179,29 @@ PROFESSIONAL_REQUEST_KEYWORDS = [
 ]
 
 OLLAMA_TIMEOUT = 60.0
+GEMINI_TIMEOUT = 30.0
+GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash-lite", "gemini-flash-latest", "gemini-3.1-flash-lite")
 _resolved_model: str | None = None
+
+
+def _ai_configured() -> bool:
+    return bool(settings.gemini_api_key or settings.openai_api_key)
+
+
+async def _call_ai(
+    prompt: str,
+    language: str,
+    history: list[dict] | None = None,
+    *,
+    json_mode: bool = False,
+) -> str | None:
+    """Try Gemini first, then Ollama, then OpenAI."""
+    reply = await _call_gemini(prompt, language, history, json_mode=json_mode)
+    if reply:
+        return reply
+    if history:
+        return None
+    return await _call_ollama(prompt, language) or await _call_openai(prompt, language)
 
 
 async def _resolve_ollama_model() -> str:
@@ -223,12 +248,15 @@ async def check_ai_status() -> dict:
     except Exception as exc:
         error = str(exc)[:120]
 
+    gemini_configured = bool(settings.gemini_api_key)
     return {
         "ollama_url": settings.ollama_base_url,
         "configured_model": settings.ollama_model,
         "active_model": model,
-        "available": available or bool(settings.openai_api_key),
+        "available": available or _ai_configured(),
         "ollama_running": available,
+        "gemini_configured": gemini_configured,
+        "gemini_model": settings.gemini_model if gemini_configured else None,
         "models": models,
         "error": error,
     }
@@ -279,6 +307,70 @@ async def _call_ollama(prompt: str, language: str) -> str | None:
     return None
 
 
+def _build_gemini_contents(prompt: str, history: list[dict] | None) -> list[dict]:
+    contents: list[dict] = []
+    for msg in history or []:
+        role = "user" if msg.get("role") == "user" else "model"
+        text = (msg.get("content") or "").strip()
+        if text:
+            contents.append({"role": role, "parts": [{"text": text}]})
+    contents.append({"role": "user", "parts": [{"text": prompt}]})
+    return contents
+
+
+async def _call_gemini(
+    prompt: str,
+    language: str,
+    history: list[dict] | None = None,
+    *,
+    json_mode: bool = False,
+) -> str | None:
+    if not settings.gemini_api_key:
+        return None
+
+    payload: dict = {
+        "systemInstruction": {"parts": [{"text": _get_system_prompt(language)}]},
+        "contents": _build_gemini_contents(prompt, history),
+        "generationConfig": {
+            "maxOutputTokens": 256 if not json_mode else 1024,
+            "temperature": 0.7,
+        },
+    }
+    if json_mode:
+        payload["generationConfig"]["responseMimeType"] = "application/json"
+
+    models_to_try = [settings.gemini_model]
+    for fallback in GEMINI_FALLBACK_MODELS:
+        if fallback not in models_to_try:
+            models_to_try.append(fallback)
+
+    for model in models_to_try:
+        try:
+            async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
+                resp = await client.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                    params={"key": settings.gemini_api_key},
+                    json=payload,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    content = "".join(part.get("text", "") for part in parts).strip()
+                    if content:
+                        return content if json_mode else _truncate_reply(content)
+                    logger.warning("Gemini returned empty content for model %s", model)
+                else:
+                    logger.warning(
+                        "Gemini chat failed (%s): HTTP %s — %s",
+                        model,
+                        resp.status_code,
+                        resp.text[:200],
+                    )
+        except Exception as exc:
+            logger.warning("Gemini chat error (%s): %s", model, exc)
+    return None
+
+
 async def _call_openai(prompt: str, language: str) -> str | None:
     if not settings.openai_api_key:
         return None
@@ -322,15 +414,18 @@ async def _generate_study_plan_with_ai(message: str, language: str) -> dict | No
 {{"reply": "1 sentence in {lang_label}", "structured_data": {{"type": "study_plan", "title": "...", "todos": [{{"id": 1, "task": "...", "deadline": "...", "priority": "high|medium|low", "completed": false}}], "tips": ["..."]}}}}
 User: {message}"""
 
-    reply = await _call_ollama(prompt, language) or await _call_openai(prompt, language)
+    reply = await _call_ai(prompt, language, json_mode=True)
     if reply:
         try:
+            return json.loads(reply)
+        except json.JSONDecodeError:
             start = reply.find("{")
             end = reply.rfind("}") + 1
             if start >= 0 and end > start:
-                return json.loads(reply[start:end])
-        except json.JSONDecodeError:
-            pass
+                try:
+                    return json.loads(reply[start:end])
+                except json.JSONDecodeError:
+                    pass
     return None
 
 
@@ -338,8 +433,9 @@ async def generate_chat_response(
     message: str,
     chat_type: str = "support",
     language: str = "en",
+    history: list[dict] | None = None,
 ) -> dict:
-    ai_available = await _check_ollama_available() or bool(settings.openai_api_key)
+    ai_available = bool(settings.gemini_api_key) or await _check_ollama_available() or bool(settings.openai_api_key)
 
     if chat_type == "breathing":
         fallback = BREATHING_FALLBACK.get(language, BREATHING_FALLBACK["en"])
@@ -347,7 +443,7 @@ async def generate_chat_response(
         used_ai = False
         if ai_available:
             prompt = f"One calming sentence for someone starting a breathing exercise. User: {message}"
-            ai_reply = await _call_ollama(prompt, language) or await _call_openai(prompt, language)
+            ai_reply = await _call_ai(prompt, language)
             if ai_reply:
                 reply_text = ai_reply
                 used_ai = True
@@ -364,7 +460,7 @@ async def generate_chat_response(
         used_ai = False
         if ai_available:
             prompt = f"One sentence recommending wellness books. User topic: {message}"
-            ai_reply = await _call_ollama(prompt, language) or await _call_openai(prompt, language)
+            ai_reply = await _call_ai(prompt, language)
             if ai_reply:
                 reply_text = ai_reply
                 used_ai = True
@@ -397,7 +493,7 @@ async def generate_chat_response(
     wants_professional = _wants_professional(message)
 
     if ai_available:
-        reply = await _call_ollama(message, language) or await _call_openai(message, language)
+        reply = await _call_ai(message, language, history)
         if reply:
             structured = None
             if is_high_risk or wants_professional:
@@ -417,5 +513,5 @@ async def generate_chat_response(
         "reply": fallback,
         "chat_type": "support",
         "structured_data": structured,
-        "ai_available": True,
+        "ai_available": False,
     }

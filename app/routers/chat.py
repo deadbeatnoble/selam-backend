@@ -17,8 +17,9 @@ async def chat_status():
 
 @router.post("/guest", response_model=ChatResponse)
 async def chat_guest(data: ChatRequest):
-    """AI chat without login — connects to local Ollama."""
-    result = await generate_chat_response(data.message, data.chat_type, data.language)
+    """AI chat without login — uses Gemini, Ollama, or OpenAI when configured."""
+    history = [{"role": m.role, "content": m.content} for m in data.history]
+    result = await generate_chat_response(data.message, data.chat_type, data.language, history)
     return ChatResponse(
         reply=result["reply"],
         chat_type=result["chat_type"],
@@ -34,7 +35,8 @@ async def chat(
     db: Session = Depends(get_db),
 ):
     language = data.language or user.language
-    result = await generate_chat_response(data.message, data.chat_type, language)
+    history = [{"role": m.role, "content": m.content} for m in data.history]
+    result = await generate_chat_response(data.message, data.chat_type, language, history)
 
     chat_log = Chat(
         user_id=user.id,

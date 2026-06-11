@@ -76,10 +76,16 @@ class AssessmentResult(BaseModel):
         from_attributes = True
 
 
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class ChatRequest(BaseModel):
     message: str
     chat_type: Literal["support", "breathing", "study_plan", "books"] = "support"
     language: Literal["en", "am", "om"] = "en"
+    history: list[ChatMessage] = []
 
 
 class ChatResponse(BaseModel):
